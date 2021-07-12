@@ -1,63 +1,88 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Product } from 'src/products/entities/product.entity';
+import { Connection, In, Repository } from 'typeorm';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
-import {InjectRepository} from "@nestjs/typeorm";
-import {EntityNotFoundError, In, Repository} from "typeorm";
-import {Order} from "./entities/order.entity";
-import {Product} from "../products/entities/product.entity";
+import { Order, OrderStatus } from './entities/order.entity';
+import { PaymentService } from './payment/payment.service';
 import { validate as uuidValidate } from 'uuid';
 
 @Injectable()
 export class OrdersService {
   constructor(
-      @InjectRepository(Product) private productRepo: Repository<Product>,
       @InjectRepository(Order) private orderRepo: Repository<Order>,
+      @InjectRepository(Product) private productRepo: Repository<Product>,
+      private paymentService: PaymentService,
+      private connection: Connection,
   ) {}
 
   async create(createOrderDto: CreateOrderDto) {
     const order = this.orderRepo.create(createOrderDto);
+
     const products = await this.productRepo.find({
       where: {
         id: In(order.items.map((item) => item.product_id)),
       },
-    })
+    });
 
     order.items.forEach((item) => {
       const product = products.find(
           (product) => product.id === item.product_id,
       );
       item.price = product.price;
-    })
+    });
+    const queryRunner = this.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    return this.orderRepo.save(order);
-  }
-
-  findAll() {
-    return this.orderRepo.find();
-  }
-
-  async findOne(id: string) {
-    let where;
-    if (uuidValidate(id)) {
-      where = { id: id }
-    } else {
-      throw new EntityNotFoundError(Order, id);
+    try {
+      const newOrder = await queryRunner.manager.save(order);
+      await this.paymentService.payment({
+        creditCard: {
+          name: order.credit_card.name,
+          number: order.credit_card.number,
+          expirationMonth: order.credit_card.expiration_month,
+          expirationYear: order.credit_card.expiration_year,
+          cvv: order.credit_card.cvv,
+        },
+        amount: order.total,
+        store: process.env.STORE_NAME,
+        description: `Produtos: ${products.map((p) => p.name).join(', ')}`,
+      });
+      await queryRunner.manager.update(
+          Order,
+          { id: newOrder.id },
+          {
+            status: OrderStatus.Approved,
+          },
+      );
+      queryRunner.commitTransaction();
+      return this.orderRepo.findOne(newOrder.id, { relations: ['items'] });
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
     }
-    return await this.orderRepo.findOne(where);
   }
 
-  async update(id: string, updateOrderDto: UpdateOrderDto) {
-    const updateResult = await this.orderRepo.update(id, updateOrderDto);
-    if (!updateResult.affected) {
-      throw new EntityNotFoundError(Order, id);
-    }
-    return this.orderRepo.findOne(id);
+  async findAll() {
+    const orders = await this.orderRepo.find();
+    return orders;
   }
 
-  async remove(id: string) {
-    const deleteResult = await this.orderRepo.delete(id);
-    if (!deleteResult.affected) {
-      throw new EntityNotFoundError(Order, id);
-    }
+  findOne(id: string) {
+    return this.orderRepo.findOneOrFail(id, {
+      relations: ['items', 'items.product'],
+    });
+  }
+
+  update(id: string, updateOrderDto: UpdateOrderDto) {
+    return `This action updates a #${id} order`;
+  }
+
+  remove(id: string) {
+    return `This action removes a #${id} order`;
   }
 }
